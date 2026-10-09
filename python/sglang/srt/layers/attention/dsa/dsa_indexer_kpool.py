@@ -1783,6 +1783,7 @@ class IndexerKPool(MultiPlatformOp):
         # ── Read phase: topk selection ──
         use_native = envs.SGLANG_DSA_NPU_TOPK_NATIVE.get()
         use_triton = envs.SGLANG_DSA_NPU_TOPK_TRITON.get()
+        use_pool_key_indexer = envs.SGLANG_DSA_NPU_TOPK_POOL_KEY_INDEXER.get()
 
         # Decode default path
         if (
@@ -1832,7 +1833,11 @@ class IndexerKPool(MultiPlatformOp):
                     forward_batch, layer_id, query, weights, metadata
                 )
         elif forward_batch.forward_mode.is_extend_without_speculative() or is_mtp:
-            if use_triton:
+            if use_pool_key_indexer and not is_mtp:
+                topk_result = self._get_topk_pool_key_indexer_ragged_npu(
+                    forward_batch, layer_id, query, weights, metadata
+                )
+            elif use_triton:
                 topk_result = self._get_topk_paged_npu_triton(
                     forward_batch, layer_id, query, weights, metadata
                 )
@@ -2562,4 +2567,164 @@ class IndexerKPool(MultiPlatformOp):
 
         return self._expand_pool_topk_and_append_tail_batched(
             pool_indices_out, seqlens_expanded, n_real, num_q
+        )
+
+    # ── aclnnPoolKeyIndexer read path (SGLANG_DSA_NPU_TOPK_POOL_KEY_INDEXER) ──
+
+    def _pool_key_indexer_check(self, page_size: int) -> None:
+        """One-time aclnnPoolKeyIndexer constraint check; fail loud at bring-up.
+
+        index_topk % index_kpool == 0 and index_kpool > 1 are already asserted
+        in __init__; index_kpool <= 64 follows from 64 % index_kpool == 0, so
+        it is inside the op's [1, 128] pool_size range.
+        """
+        if getattr(self, "_pool_key_indexer_checked", False):
+            return
+        if self.head_dim != 128:
+            raise RuntimeError(
+                f"pool_key_indexer requires index_head_dim=128, got {self.head_dim}"
+            )
+        if self.n_heads > 64:
+            raise RuntimeError(
+                f"pool_key_indexer requires index_n_heads<=64, got {self.n_heads}"
+            )
+        topk_ok = 1 <= self.index_topk <= 2048 or self.index_topk in (
+            3072,
+            4096,
+            5120,
+            6144,
+            7168,
+            8192,
+        )
+        if not topk_ok:
+            raise RuntimeError(
+                f"pool_key_indexer unsupported index_topk={self.index_topk}"
+            )
+        if page_size % 16 != 0 or page_size > 2048:
+            raise RuntimeError(
+                "pool_key_indexer requires page_size % 16 == 0 and page_size "
+                f"<= 2048, got {page_size}"
+            )
+        self._pool_key_indexer_checked = True
+
+    def _pool_key_indexer_sparse_indices(
+        self,
+        layer_id: int,
+        query_tnd: torch.Tensor,
+        weights_bf16: torch.Tensor,
+        pool_block_tables: torch.Tensor,
+        causal_lens_cpu: List[int],
+    ) -> torch.Tensor:
+        """One aclnnPoolKeyIndexer call: TND query over the PA_BBND pooled cache.
+
+        Fuses pool-level topk, token-index expansion and tail-pool append into
+        a single op, returning [n_real, index_topk + index_kpool - 1] int32
+        with -1 padding — the same contract as npu_lightning_indexer followed
+        by _expand_pool_topk_and_append_tail_batched. pool_tail_k /
+        actual_seq_* map to aclIntArray (host side), so causal lens come from
+        the host seq lens without any device sync.
+        """
+        import attentions  # noqa: F401
+
+        self._pool_key_indexer_check(get_token_to_kv_pool().page_size)
+        try:
+            op = torch.ops.attentions.pool_key_indexer
+        except (AttributeError, RuntimeError) as e:
+            raise RuntimeError(
+                "SGLANG_DSA_NPU_TOPK_POOL_KEY_INDEXER=1 needs the "
+                "pool_key_indexer aclnn op in the customize OPP plus a "
+                f"rebuilt sgl-kernel-npu attentions plugin: {e}"
+            ) from e
+
+        pool_size = self.index_kpool
+        kv_cache = get_token_to_kv_pool().get_index_k_with_scale_buffer(layer_id)
+        return op(
+            query=query_tnd,
+            pool_key=kv_cache,
+            weights=weights_bf16,
+            pool_tail_k=[length % pool_size for length in causal_lens_cpu],
+            actual_seq_q=list(range(1, len(causal_lens_cpu) + 1)),
+            actual_seq_k=[length // pool_size for length in causal_lens_cpu],
+            block_table=pool_block_tables,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            topk=self.index_topk,
+            pool_size=pool_size,
+            mask_mode=3,
+            quant_mode=-1,
+            return_value=False,
+        )
+
+    def _pad_pool_key_indexer_result(
+        self, sparse_indices: torch.Tensor, n_real: int, num_q: int
+    ) -> torch.Tensor:
+        k_cols = self.index_topk + self.index_kpool - 1
+        if n_real == num_q:
+            return sparse_indices
+        topk_result = torch.full(
+            (num_q, k_cols), -1, dtype=torch.int32, device=sparse_indices.device
+        )
+        topk_result[:n_real] = sparse_indices
+        return topk_result
+
+    def _get_topk_pool_key_indexer_ragged_npu(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        query_bf16: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        """Extend topk via aclnnPoolKeyIndexer with per-token causal lens.
+
+        Drop-in for _get_topk_ragged_npu (regular extend only; MTP keeps the
+        old paths). Each token is its own 1-token sequence — the same trick
+        the npu_lightning_indexer ragged path uses — so the per-token causal
+        pool count is derived on host from the request seq lens.
+        """
+        from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
+            build_pooled_page_table_64,
+        )
+
+        seqlens_expanded = metadata.get_seqlens_expanded()
+        n_real_tokens = seqlens_expanded.shape[0]
+        num_q = query_bf16.shape[0]
+
+        # Token j of request i sits at absolute position first_pos + j, so its
+        # causal token count is first_pos + j + 1, matching
+        # dsa_seqlens_expanded for regular extend.
+        causal_lens_cpu: List[int] = []
+        for i in range(forward_batch.batch_size):
+            q_len = int(forward_batch.extend_seq_lens_cpu[i])
+            if q_len == 0:
+                continue
+            first_pos = int(forward_batch.seq_lens_cpu[i]) - q_len
+            causal_lens_cpu.extend(range(first_pos + 1, first_pos + q_len + 1))
+        assert len(causal_lens_cpu) == n_real_tokens, (
+            "pool_key_indexer host causal lens "
+            f"({len(causal_lens_cpu)}) != expanded rows ({n_real_tokens})"
+        )
+
+        block_tables = metadata.get_page_table_64()
+        token_request_ids = metadata.get_token_to_batch_idx()
+        pool_block_tables = build_pooled_page_table_64(
+            block_tables[token_request_ids], self.index_kpool
+        ).contiguous()
+        if pool_block_tables.dtype != torch.int32:
+            pool_block_tables = pool_block_tables.to(torch.int32)
+
+        w_2d = weights[:n_real_tokens]
+        if w_2d.ndim == 3:
+            w_2d = w_2d.squeeze(-1)
+        w_2d = w_2d.to(torch.bfloat16)
+
+        sparse_indices = self._pool_key_indexer_sparse_indices(
+            layer_id,
+            query_bf16[:n_real_tokens],
+            w_2d,
+            pool_block_tables,
+            causal_lens_cpu,
+        )
+        return self._pad_pool_key_indexer_result(
+            sparse_indices, n_real_tokens, num_q
         )

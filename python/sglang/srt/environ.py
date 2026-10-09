@@ -1502,6 +1502,15 @@ class Envs:
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     SGLANG_DSA_NPU_TOPK_NATIVE = EnvBool(False)
     SGLANG_DSA_NPU_TOPK_TRITON = EnvBool(False)
+    # Replace the NPU DSA extend read side (npu_lightning_indexer + expand
+    # Triton) with the aclnnPoolKeyIndexer op: pool-level topk, token
+    # expansion and tail append fused into one call over the pooled BF16
+    # index-K cache. Extend only (eager, prefill node): the op takes
+    # pool_tail_k / actual_seq_* as host-side aclIntArray, which graph
+    # capture would freeze, so decode and MTP keep the old paths. Requires
+    # the pool_key_indexer op in the customize OPP plus the sgl-kernel-npu
+    # attentions plugin.
+    SGLANG_DSA_NPU_TOPK_POOL_KEY_INDEXER = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel
