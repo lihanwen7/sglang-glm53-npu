@@ -52,6 +52,14 @@ class AscendTPDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
+        self.num_local_experts = moe_runner_config.num_local_experts
+        self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
+        self.num_local_routed_experts = (
+            self.num_local_experts - self.num_local_shared_experts
+        )
+        self.moe_ep_size = get_parallel().moe_ep_size
+        self.moe_ep_rank = get_parallel().moe_ep_rank
+        self.local_expert_mapping = None
         self.top_k = moe_runner_config.top_k
         self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
@@ -100,6 +108,30 @@ class AscendTPDispatcher(BaseDispatcher):
         topk_weights, topk_ids, _ = topk_output
         topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
+        if self.moe_ep_size > 1:
+            if self.local_expert_mapping is None:
+                self.local_expert_mapping = torch.full(
+                    (self.num_experts,), -1, dtype=torch.int32, device=topk_ids.device
+                )
+                start = self.moe_ep_rank * self.num_local_routed_experts
+                self.local_expert_mapping[
+                    start : start + self.num_local_routed_experts
+                ] = torch.arange(
+                    self.num_local_routed_experts,
+                    dtype=torch.int32,
+                    device=topk_ids.device,
+                )
+                if self.num_local_shared_experts:
+                    self.local_expert_mapping[-self.num_local_shared_experts :] = (
+                        torch.arange(
+                            self.num_local_routed_experts,
+                            self.num_local_experts,
+                            dtype=torch.int32,
+                            device=topk_ids.device,
+                        )
+                    )
+            # Unowned experts use the routing op's dropped-row sentinel.
+            topk_ids = self.local_expert_mapping[topk_ids]
         top_k = topk_weights.shape[-1]
 
         (
@@ -110,7 +142,7 @@ class AscendTPDispatcher(BaseDispatcher):
         ) = self.init._init_routing(
             hidden_states,
             topk_ids,
-            self.num_experts,
+            self.num_local_experts,
             top_k,
         )
 

@@ -2128,7 +2128,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _is_npu:
-            return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+            from sglang.kernels.ops.layernorm.mhc import (
+                _npu_hc_post_ops_transformer,
+            )
+
+            return _npu_hc_post_ops_transformer(x, residual, post, comb)
 
         if _is_xpu:
             return _get_mhc_ops().mhc_post(x, residual, post, comb)

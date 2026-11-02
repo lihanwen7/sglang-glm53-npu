@@ -135,10 +135,12 @@ def _remap_glm5_next_weight_name(name: str) -> str:
 
 @torch.compile(disable=is_npu())
 def swiglu_clamped(y: torch.Tensor, limit: float):
-    gate, up = torch.chunk(y, 2, dim=-1)
+    # Match the training ViT: evaluate clipping and SwiGLU in FP32, then
+    # round once before the down projection.
+    gate, up = torch.chunk(y.float() if is_npu() else y, 2, dim=-1)
     gate = torch.clamp(gate, max=limit)
     up = torch.clamp(up, min=-limit, max=limit)
-    return F.silu(gate) * up
+    return (F.silu(gate) * up).to(y.dtype)
 
 
 class Glm5NextVisionMLP(GlmOcrVisionMLP):
@@ -189,6 +191,10 @@ class Glm5NextVisionPatchMerger(GlmOcrVisionPatchMerger):
             use_data_parallel=use_data_parallel,
         )
         self.swiglu_limit = swiglu_limit
+        if is_npu():
+            # HF's merger uses torch LayerNorm: eps=1e-5, model-dtype input
+            # and parameters. SGLang's generic norm defaults to eps=1e-6/FP32.
+            self.post_projection_norm = nn.LayerNorm(d_model, eps=1e-5)
 
     def forward(self, x: torch.Tensor):
         x, _ = self.proj(x)
@@ -197,6 +203,25 @@ class Glm5NextVisionPatchMerger(GlmOcrVisionPatchMerger):
         x = swiglu_clamped(gate_up, self.swiglu_limit)
         x, _ = self.down_proj(x)
         return x
+
+
+class Glm5NextVisionSDPA(nn.Module):
+    """Match the training ViT's per-sequence, unmasked SDPA on Ascend."""
+
+    def forward(self, q, k, v, cu_seqlens, bsz, seq_len,
+                softmax_scale=None, forward_metadata=None, **kwargs):
+        cu = forward_metadata.cu_seqlens if forward_metadata is not None else cu_seqlens
+        boundaries = cu.tolist()
+        outputs = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            query, key, value = [
+                x[start:end].transpose(0, 1).unsqueeze(0) for x in (q, k, v)
+            ]
+            output = F.scaled_dot_product_attention(
+                query, key, value, dropout_p=0.0, is_causal=False, scale=softmax_scale
+            )
+            outputs.append(output.squeeze(0).transpose(0, 1))
+        return torch.cat(outputs, dim=0)
 
 
 class Glm5NextVisionBlock(GlmOcrVisionBlock):
@@ -234,6 +259,9 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             use_data_parallel=use_data_parallel,
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
+        if is_npu():
+            self.attn.qkv_backend = Glm5NextVisionSDPA()
+            self.attn.qkv_backend_name = "sdpa"
         self.mlp = Glm5NextVisionMLP(
             dim,
             intermediate_dim,
@@ -280,6 +308,16 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             dtype=torch.float32 if is_npu() else None,
         )
 
+        # HF training forms angles and sin/cos on the accelerator. CPU
+        # precomputed sin/cos can differ by one FP32 ULP and amplify across
+        # this ViT's BF16 residual blocks.
+        rotary_dim = head_dim // 2
+        self.register_buffer(
+            "_training_inv_freq",
+            (1.0 / (10000.0 ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device="cpu") / rotary_dim))).to(self.patch_embed.proj.weight.device),
+            persistent=False,
+        )
+
         self.blocks = nn.ModuleList(
             [
                 Glm5NextVisionBlock(
@@ -322,6 +360,30 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         self.post_layernorm = GlmOcrRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
         )
+
+
+    def forward(self, x, grid_thw):
+        # Match training's per-image shapes, regardless of serving batch size.
+        if not is_npu() or len(grid_thw) <= 1:
+            return super().forward(x, grid_thw)
+        counts = grid_thw.prod(dim=-1).tolist()
+        return torch.cat([
+            super(Glm5NextVisionModel, self).forward(pixels, grid_thw[i:i + 1])
+            for i, pixels in enumerate(x.split(counts))
+        ], dim=0)
+
+    def _apply(self, fn, recurse=True):
+        inv_freq = self._training_inv_freq
+        super()._apply(fn, recurse=recurse)
+        self._training_inv_freq = inv_freq.to(device=self._training_inv_freq.device)
+        return self
+
+    def rot_pos_emb(self, grid_thw):
+        cos, sin, positions = super().rot_pos_emb(grid_thw)
+        if not is_npu():
+            return cos, sin, positions
+        angles = (positions.unsqueeze(-1) * self._training_inv_freq).flatten(1)
+        return angles.cos(), angles.sin(), positions
 
 
 class Glm5NextLinearAttention(nn.Module):
@@ -1705,3 +1767,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
 
 EntryClass = [Glm5NextForConditionalGeneration]
+
+# Optional paired ViT feature validation; no effect unless explicitly enabled.
+if __import__('os').environ.get('GLM53_VIT_CAPTURE_DIR'):
+    from glm53_vit_feature_capture import install as _install_vit_capture
+    _install_vit_capture(Glm5NextVisionModel, 'rollout')

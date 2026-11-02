@@ -1865,6 +1865,58 @@ def _mhc_pre_dispatch(
     return post_mix, comb_mix, layer_input, norm_weight is not None
 
 
+def _npu_hc_pre_ops_transformer(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    hc_eps: float,
+    rms_eps: float,
+):
+    """GLM mHC hc_pre on NPU via the CANN-bundled ops-transformer package.
+
+    The legacy cann-recipes-infer custom_ops HcPreSinkhorn kernel copies the
+    per-round x rows with a fixed rowFactor instead of the actual tail row
+    count, reading up to 2 rows (64 KiB) past the end of x whenever a block's
+    row count is not a multiple of 3 (MTE/page-fault 507035, see hc_error).
+    CANN 9.1.0 ships ``cann_ops_transformer`` with a flat op layout
+    (``cann_ops_transformer.ops.mhc_pre_sinkhorn``); use it directly, no
+    fallback to the legacy custom_ops.
+
+    The installed wrapper only accepts the BSND 4D layout (its meta/csrc read
+    ``x.size(3)``), so x is expanded to ``(s, 1, n, c)`` and the outputs are
+    squeezed back to the TND shapes the GLM stack uses: hin (s, c),
+    h_post (s, n), h_res (s, n*n).
+    """
+    from cann_ops_transformer.ops import mhc_pre_sinkhorn
+
+    hin, h_post, h_res = mhc_pre_sinkhorn(
+        x.unsqueeze(1), fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, rms_eps
+    )
+    return hin.squeeze(1), h_post.squeeze(1), h_res.squeeze(1)
+
+
+def _npu_hc_post_ops_transformer(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    h_post: torch.Tensor,
+    h_res: torch.Tensor,
+) -> torch.Tensor:
+    """GLM mHC hc_post on NPU via the CANN-bundled ops-transformer package.
+
+    ops-transformer signature is mhc_post(x, hRes, hOut, hPost) with the
+    golden formula y = hPost[i]*hOut + sum_j(hRes[i,j]*x[j]): hOut is the
+    pre-norm activation x, hPost is per-stream post scale and the summed term
+    runs over the residual stream (arg order matches the legacy
+    npu_hc_post(x, residual, h_post, h_res)).
+    """
+    from cann_ops_transformer.ops import mhc_post
+
+    return mhc_post(residual, h_res, x, h_post)
+
+
 @torch._dynamo.disable
 def _mhc_post_dispatch(
     x: torch.Tensor,
@@ -1875,7 +1927,7 @@ def _mhc_post_dispatch(
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
     if is_npu():
-        return torch.ops.custom.npu_hc_post(
+        return _npu_hc_post_ops_transformer(
             x, residual, post_layer_mix.squeeze(-1), comb_res_mix
         )
     if is_npu_a5() or not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
@@ -1910,15 +1962,15 @@ def hc_pre(
     fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
     residual_3d = x.view(s, hc_mult, hidden_size)
     if is_npu():
-        y, post, comb = torch.ops.custom.npu_hc_pre(
+        y, post, comb = _npu_hc_pre_ops_transformer(
             residual_3d,
             fn,
             hc_scale,
             hc_base,
-            hc_mult=hc_mult,
-            hc_sinkhorn_iters=sinkhorn_iters,
-            norm_eps=rms_eps,
-            hc_eps=hc_eps,
+            hc_mult,
+            sinkhorn_iters,
+            hc_eps,
+            rms_eps,
         )
         post_mix, comb_mix, layer_input, norm_fused = post, comb, y, False
     else:
@@ -2001,15 +2053,15 @@ def npu_hc_pre(
     # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
     # cast back to the input dtype before the downstream
     # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
-    y, post, comb = torch.ops.custom.npu_hc_pre(
+    y, post, comb = _npu_hc_pre_ops_transformer(
         x,
         hc_fn,
         hc_scale,
         hc_base,
-        hc_mult=hc_mult,
-        hc_sinkhorn_iters=hc_sinkhorn_iters,
-        norm_eps=rms_norm_eps,
-        hc_eps=hc_eps,
+        hc_mult,
+        hc_sinkhorn_iters,
+        hc_eps,
+        rms_norm_eps,
     )
     # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
     # not fold input_layernorm. Return norm_fused=False so the caller

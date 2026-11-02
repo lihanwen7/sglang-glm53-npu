@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUGeluAndMul,
     NPUSitu,
     NPUSwiglu,
+    NPUSwigluClamped,
     NPUSwigluDeepEPKernel,
     NPUSwigluOAI,
     NPUSwigluQuant,
@@ -131,6 +132,8 @@ class AscendRunnerCore(MoeRunnerCore):
                         inner = NPUSwigluStepAndMul(
                             clamp_limit=config.gemm1_clamp_limit
                         )
+                    elif config.swiglu_limit is not None:
+                        inner = NPUSwigluClamped(limit=config.swiglu_limit)
                     else:
                         inner = NPUSwiglu()
                 else:

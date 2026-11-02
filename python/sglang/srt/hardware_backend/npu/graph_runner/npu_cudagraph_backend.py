@@ -15,6 +15,7 @@ from __future__ import annotations
 import threading
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
+import os
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import numpy as np
@@ -108,6 +109,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx = partial(
                 self._memory_saver_adapter.cuda_graph,
                 tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
+                # Preserve captured allocation contents across physical remapping.
+                enable_cpu_backup=os.environ.get("SGLANG_NPU_GRAPH_CPU_BACKUP") == "1",
             )
         else:
             graph_ctx = torch.npu.graph
@@ -115,7 +118,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         with (
             skip_guard_context,
             graph_ctx(
-                graph,
+                **({"cuda_graph": graph} if self._memory_saver_adapter is not None and self._memory_saver_adapter.enabled else {"npu_graph": graph}),
                 pool=self._pool,
                 stream=self._capture_stream,
                 auto_dispatch_capture=True,

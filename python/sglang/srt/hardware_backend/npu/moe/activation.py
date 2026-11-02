@@ -184,6 +184,20 @@ class NPUSwigluOAI(BaseActivation):
         return output, None
 
 
+class NPUSwigluClamped(BaseActivation):
+    """GLM SwiGLU: clamp gate/up before the fused SiLU-and-multiply."""
+
+    def __init__(self, limit: float):
+        self.limit = limit
+
+    def _apply_activation(self, hidden_states: torch.Tensor):
+        gate, up = hidden_states.chunk(2, dim=-1)
+        clamped = torch.cat(
+            [gate.clamp(max=self.limit), up.clamp(-self.limit, self.limit)], dim=-1
+        )
+        return torch.ops.npu.npu_swiglu(clamped), None
+
+
 class NPUSwigluStepAndMul(BaseActivation):
     def __init__(self, clamp_limit: Optional[float] = None):
         self._clamp_limit = clamp_limit

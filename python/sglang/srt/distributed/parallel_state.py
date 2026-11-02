@@ -1175,29 +1175,41 @@ class GroupCoordinator:
         sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
         world_size = self.world_size
-        pynccl_comm = self.pynccl_comm
+        if sizes is not None:
+            assert len(sizes) == world_size
+            assert input_.shape[0] == sum(sizes)
+            chunk_size = sizes[self.rank_in_group]
+        else:
+            assert input_.shape[0] % world_size == 0
+            chunk_size = input_.shape[0] // world_size
+        output_shape = (chunk_size,) + input_.shape[1:]
 
+        if output is None:
+            output = torch.empty(
+                output_shape, dtype=input_.dtype, device=input_.device
+            )
+        else:
+            assert output.shape == output_shape
+
+        if _is_npu:
+            # HCCL owns NPU collectives; pynccl is only created for CUDA devices.
+            if sizes is None or all(size == chunk_size for size in sizes):
+                torch.distributed.reduce_scatter_tensor(
+                    output, input_, group=self.device_group
+                )
+            else:
+                import torch_npu
+
+                torch_npu.distributed.reduce_scatter_tensor_uneven(
+                    output, input_, input_split_sizes=sizes, group=self.device_group
+                )
+            return output
+
+        pynccl_comm = self.pynccl_comm
         with pynccl_comm.change_state(enable=True):
             assert pynccl_comm is not None and not pynccl_comm.disabled, (
                 "pynccl is required for reduce_scatterv"
             )
-
-            if sizes is not None:
-                assert len(sizes) == world_size
-                assert input_.shape[0] == sum(sizes)
-                chunk_size = sizes[self.rank_in_group]
-            else:
-                assert input_.shape[0] % world_size == 0
-                chunk_size = input_.shape[0] // world_size
-            output_shape = (chunk_size,) + input_.shape[1:]
-
-            if output is None:
-                output = torch.empty(
-                    output_shape, dtype=input_.dtype, device=input_.device
-                )
-            else:
-                assert output.shape == output_shape
-
             pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
             return output
 

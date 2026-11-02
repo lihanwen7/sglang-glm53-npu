@@ -202,7 +202,12 @@ def kpool_decode_update_and_maybe_write_cache_bf16(
 
     tail_size = tail_k.shape[1]
     req_pool_size = tail_k.shape[0]
-    buf_numel_per_page = buf.shape[1]
+    # buf_numel_per_page = buf.shape[1]
+
+    # 每页元素数需要包含除 pages 外的所有维度，同时兼容二维和四维缓存。seren
+    buf_numel_per_page = math.prod(buf.shape[1:])
+    assert buf_numel_per_page == slots_per_page * head_dim
+    
     block_table_cols = block_tables.shape[1]
 
     # Ensure contiguous

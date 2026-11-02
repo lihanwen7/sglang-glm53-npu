@@ -285,7 +285,12 @@ def get_processor(
                 **kwargs,
             )
         else:
-            if config.model_type in _CUSTOMIZED_MM_PROCESSOR:
+            if config.model_type == "glm5_next":
+                from sglang.srt.multimodal.glm5_next_processing import Glm5NextProcessor
+                processor = Glm5NextProcessor.from_pretrained(
+                    tokenizer_name, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+                )
+            elif config.model_type in _CUSTOMIZED_MM_PROCESSOR:
                 processor = _CUSTOMIZED_MM_PROCESSOR[config.model_type].from_pretrained(
                     tokenizer_name,
                     *args,

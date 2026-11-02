@@ -67,10 +67,11 @@ dependencies = [
   "xxhash",
   "xgrammar==0.2.1",
   "memfabric-hybrid==1.1.4",
-  "memfabric-zbal==1.2.0",
 ]
 
 [project.optional-dependencies]
+# Optional NPU allocator/transport; default GLM path keeps SGLANG_ZBAL_LOCAL_MEM_SIZE=0.
+npu-zbal = ["memfabric-zbal==1.2.0"]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
   "addict",

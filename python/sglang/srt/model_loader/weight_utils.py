@@ -56,7 +56,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
@@ -931,6 +931,23 @@ class CheckpointFilePrefetchHandle:
         return tuple(self._errors)
 
 
+def _get_checkpoint_prefetch_rank() -> Tuple[int, int]:
+    """Return a dense rank and rank count within this node's checkpoint cache."""
+    if not torch.distributed.is_initialized():
+        return 0, 1
+
+    world_group = get_world_group()
+    # SGLang launches contiguous TP/PP ranks per node. LOCAL_SIZE is optional
+    # and local_rank is a device index (possibly offset or strided), so neither
+    # is a reliable count/ordinal for distributing files across local workers.
+    nnodes = get_server_args().nnodes
+    if nnodes < 1 or world_group.world_size % nnodes:
+        raise ValueError("Checkpoint prefetch requires equal ranks per node")
+    local_world_size = world_group.world_size // nnodes
+    local_rank = world_group.rank_in_group % local_world_size
+    return local_rank, local_world_size
+
+
 def _prefetch_all_checkpoints(
     sorted_files: List[str],
     num_threads: int = 4,
@@ -958,13 +975,7 @@ def _prefetch_all_checkpoints(
     # Use node-local rank so that each node independently prefetches the
     # full checkpoint into its own page cache. Global rank would split files
     # across nodes, but page cache is not shared across nodes.
-    if torch.distributed.is_initialized():
-        world_group = get_world_group()
-        local_rank = world_group.local_rank
-        local_world_size = world_group.local_size or world_group.world_size
-    else:
-        local_rank = 0
-        local_world_size = 1
+    local_rank, local_world_size = _get_checkpoint_prefetch_rank()
 
     my_files = sorted_files[local_rank::local_world_size]
     total_for_rank = len(my_files)
