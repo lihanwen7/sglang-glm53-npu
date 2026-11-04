@@ -5674,6 +5674,13 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    if server_args.device == "npu":
+        from sglang.srt.utils.cann_compile_forkserver import (
+            prepare_cann_compile_forkserver,
+        )
+
+        prepare_cann_compile_forkserver()
+
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     # Publish before anything in this process reads configuration.
