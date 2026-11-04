@@ -22,6 +22,9 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+from sglang.srt.distributed.device_communicators.npu_tms_collectives import (
+    stage_graph_collectives,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -72,7 +75,11 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         try:
-            yield
+            with stage_graph_collectives(
+                self._memory_saver_adapter is not None
+                and self._memory_saver_adapter.enabled
+            ):
+                yield
         finally:
             self._capture_stream = None
 

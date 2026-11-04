@@ -1071,6 +1071,9 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        if self.npu_communicator is not None and not self.npu_communicator.disabled:
+            self.npu_communicator.reduce_scatter_tensor(output, input)
+            return output
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -1214,6 +1217,9 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if self.npu_communicator is not None and not self.npu_communicator.disabled:
+            self.npu_communicator.all_gather_into_tensor(output, input)
+            return
         # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
         # Aiter's should_custom_ag still owns shape/layout validation:
         # 16B alignment, weak-contiguous, supported topology, and per-rank

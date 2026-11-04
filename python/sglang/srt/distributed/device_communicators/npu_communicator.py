@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.distributed.device_communicators.npu_tms_collectives import GraphCollectiveStaging
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -18,6 +19,7 @@ class NpuCommunicator:
         self.disabled = False
         self.group = group
         self.world_size = dist.get_world_size(self.group)
+        self.graph_staging = GraphCollectiveStaging(group)
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(x, group=self.group)
@@ -39,8 +41,8 @@ class NpuCommunicator:
             output_size[:1], dtype=scale.dtype, device=scale.device
         )
         # All-gather.
-        dist.all_gather_into_tensor(output_tensor, x_q, group=self.group)
-        dist.all_gather_into_tensor(output_scale, scale, group=self.group)
+        self.all_gather_into_tensor(output_tensor, x_q)
+        self.all_gather_into_tensor(output_scale, scale)
 
         output_tensor = output_tensor.to(x.dtype) * output_scale.unsqueeze(-1).to(
             x.dtype
@@ -49,6 +51,12 @@ class NpuCommunicator:
         output_tensor = output_tensor.reshape((world_size,) + input_size)
 
         return output_tensor.sum(dim=0)
+
+    def all_gather_into_tensor(self, output, input):
+        return self.graph_staging.all_gather_into_tensor(output, input)
+
+    def reduce_scatter_tensor(self, output, input):
+        return self.graph_staging.reduce_scatter_tensor(output, input)
 
     def all_gather(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
@@ -60,7 +68,7 @@ class NpuCommunicator:
         # Allocate output tensor.
         output_tensor = torch.empty(output_size, dtype=x.dtype, device=x.device)
         # All-gather.
-        dist.all_gather_into_tensor(output_tensor, x, group=self.group)
+        self.all_gather_into_tensor(output_tensor, x)
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)

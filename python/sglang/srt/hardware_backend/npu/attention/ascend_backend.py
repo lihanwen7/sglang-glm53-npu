@@ -59,10 +59,25 @@ def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
 
 
 def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
-    """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
+    """Canonicalize sparse indices for the NPU attention operator.
+
+    KPool appends causal tail tokens after the fixed-width pool top-k region.
+    Short prefixes therefore have invalid slots before valid tail entries.
+    A3 SFA does not consume those later entries correctly: valid slots must
+    form a contiguous prefix. Preserve their order and multiplicity, and
+    normalize all invalid slots (including expanded -4/-3/-2) to trailing -1.
+    """
     if topk_indices.dim() == 2:
-        return topk_indices.unsqueeze(-2)
-    return topk_indices
+        topk_indices = topk_indices.unsqueeze(-2)
+    valid = topk_indices >= 0
+    width = topk_indices.shape[-1]
+    positions = torch.arange(width, device=topk_indices.device, dtype=torch.int32)
+    # Position keys are unique; FP32 sorting is supported on Ascend and is
+    # exact for the supported sparse selection widths (at most 8192).
+    keys = torch.where(valid, positions, positions + width).float()
+    order = keys.argsort(dim=-1)
+    normalized = torch.where(valid, topk_indices, -1)
+    return normalized.gather(-1, order).contiguous()
 
 
 def _reshape_kv_for_fia_nz(
