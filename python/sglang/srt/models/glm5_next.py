@@ -1194,6 +1194,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         vision_utils.update_vit_attn_dummy_heads_config(config)
+        # DP encoder keeps all vision heads local, independent of language TP.
+        if get_mm().mm_enable_dp_encoder:
+            config.vision_config.num_dummy_heads = 0
         self.mm_config = config
         text_config = config.text_config
         self.encoder_only = bool(getattr(config, "encoder_only", False))
